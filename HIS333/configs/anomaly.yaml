@@ -1,0 +1,15 @@
+# Anomaly detection fine-tuning and inference config
+seed: 66
+device: "cuda:0"
+anomaly_batch_size: 16
+anomaly_epochs: 20
+learning_rate_anomaly: 1e-4
+freeze_encoder: true
+use_lora: false
+head_weights:
+  lm_nll: 0.4
+  recon: 0.3
+  one_class: 0.3
+encoder_ckpt: "checkpoints/encoder/universal_hsi_encoder.pth"
+detector_ckpt: "checkpoints/anomaly/anomaly_detector.pth"
+target_data: "data/target_scene.npz"
