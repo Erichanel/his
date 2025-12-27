@@ -1,0 +1,66 @@
+你是资深PyTorch研究工程师。请按我仓库风格（configs/ + main_*.py + encoder/ + sspq_tokenizer/ + utils/）实现一个模块化模型：HSI-VQ-SSSE。必须严格遵守以下固定规格：patch=9×9；GWPCA输出64维（8组×8PC）；空间cube_size=3（non-overlap）；光谱分组T=8每组L=8；每个token cube为3×3×8（flatten F=72）；token网格为P=9(3×3)×T=8，N=72 tokens/patch。每个cube对应一个token位置(p,t)。
+
+总体路线（最强路线）：Stage1 tokenizer 用轻量CNN/1DConv + 双码本VQ（SSPQ），Stage2 用HSIMAE风格SSSE Transformer（空间/光谱分离编码）+ 可分离位置编码(Pos2D+Pos1D) + 行/列一致性结构化mask。禁止使用joint_id，必须使用factorized预测：分别预测光谱码本索引k与空间码本索引m；异常分数用NLL(k)+NLL(m)。
+
+请创建/修改文件（如目录不存在则创建），并确保代码可运行（至少用随机数据跑通一次forward/backward）：
+
+1) utils/gwpca.py
+- apply_gwpca(x, group=8, nc_per_group=8, whiten=True)->x_pca
+- 输入可为 numpy/torch 的 [H,W,C_raw] 或 [B,C_raw,H,W]；输出必须能得到 [B,64,9,9]（patch级）。可用sklearn PCA或SVD简化实现，必须可跑通。
+
+2) utils/cube_partition.py
+- make_cubes(x:[B,64,9,9], patch_size=9, cube_size=3, T=8)->(cubes, meta)
+- 输出 cubes:[B,P=9,T=8,F=72]，F=3*3*8；meta含Hs=3,Ws=3,L=8,F=72。
+- 切分规则：先 reshape 到 [B,T=8,L=8,9,9]，空间non-overlap unfold(3×3, stride=3) 得到P=9，最后输出顺序为[B,P,T,F]。所有reshape加assert。
+
+3) utils/pos_embed.py
+- get_1d_sincos_pos_embed(T,D)->[T,D]
+- get_2d_sincos_pos_embed(Hs,Ws,D)->[P,D]
+- build_separable_pos_embed(Hs,Ws,T,D,device)->[P,T,D]=pos2d[:,None,:]+pos1d[None,:,:]
+
+4) utils/masking.py
+- hsimae_consistent_mask(B,P=9,T=8,mr_spa=0.5,mr_spe=0.5,device,seed=None)->mask[B,P,T]
+- 规则：每样本独立采样Mp大小ceil(mr_spa*P)、Mt大小ceil(mr_spe*T)，mask[p,t]=True if p in Mp OR t in Mt；返回实际mask比例统计。
+
+5) sspq_tokenizer/vq.py
+- VectorQuantizerEMA（推荐）或普通VQ
+- forward(z_e)->z_q, indices, vq_loss, perplexity
+- 参数：codebook_size, dim, decay=0.99, beta=0.25
+
+6) sspq_tokenizer/tokenizer.py
+- SSPQTokenizer：双分支tokenizer（光谱分支1DConv，空间分支2D CNN）
+- 输入 cubes:[B,9,8,72]
+- 光谱分支：恢复cube->[B,9,8,3,3,8]，空间mean-> [B,9,8,8]，reshape [B*9*8,1,8]，Conv1d×2(k=3,pad=1)+GELU，flatten+Linear->z_e_s[D_vq]，VQ_s->k_idx[B,9,8]与emb_s[B,9,8,D]
+- 空间分支：cube-> [B*9*8,8,3,3]，Conv2d×2(k=3,pad=1)+GELU，flatten+Linear->z_e_x[D_vq]，VQ_x->m_idx[B,9,8]与emb_x[B,9,8,D]
+- 返回 dict：k_idx,m_idx,emb_s,emb_x,vq_loss_dict,total。所有维度assert。
+
+7) encoder/vit_blocks.py
+- TransformerBlock（ViT-style）：LN+MHA+residual，LN+MLP(GELU)+residual，batch_first=True，dropout可配置。
+
+8) encoder/ssse_encoder.py
+- SSSEEncoder：SpatialEncoder(depth_spa), SpectralEncoder(depth_spe), FusionBlock(depth_fuse)
+- 输入 tok:[B,9,8,D] + mask:[B,9,8]；用learnable mask_token替换masked位置。
+- Spatial：reshape [B,9,8,D]->[B,8,9,D]->[B*8,9,D] 编码后再回到[B,9,8,D]
+- Spectral：reshape [B,9,8,D]->[B*9,8,D] 编码后再回到[B,9,8,D]
+- 融合：FusionBlock(z_spa+z_spe)->z[B,9,8,D]
+
+9) models/hsi_vq_ssse.py
+- HSIVQSSSEModel：组装 make_cubes + SSPQTokenizer + token_fuse( concat emb_s/emb_x -> MLP ) + pos_embed + mask + SSSEEncoder + heads
+- MTP heads：head_k Linear(D->Ks), head_m Linear(D->Kx)
+- forward_pretrain(x:[B,64,9,9])：生成 mask，编码得到z，输出 logits_k[B,9,8,Ks], logits_m[B,9,8,Kx]；loss_mtp只在mask位置CE；nll_map为NLL(k)+NLL(m)；loss_total=loss_mtp+vq_loss_total
+- forward_classify(x,y=None)：pool mean over P,T；cls_head Linear(D->num_classes)；可选联合loss=loss_cls+lambda_mtp*loss_mtp+vq_loss
+- forward_anomaly(x)：返回 anomaly_score[B]=mean或topk_mean(nll_map)，并给出 anomaly_map_spatial[B,3,3]（对T均值后reshape）
+
+10) configs/*.yaml
+- 三个yaml：pretrain/classify/anomaly；至少包含：patch_size=9,cube_size=3,T=8,L=8,C_in=64,pca_group=8,pca_nc_per_group=8,Ks,Kx,D,D_vq,depth_spa,depth_spe,depth_fuse,heads,mlp_ratio,dropout,mr_spa,mr_spe,num_classes,lambda_mtp,vq_decay,vq_beta,lr,wd,epochs,batch_size,seed
+
+11) main_pretrain.py / main_classify.py / main_anomaly.py
+- 保持仓库入口风格；若缺少配置读取，写一个简易yaml读取。
+- 至少用随机数据演示可跑通一次forward/backward，并打印关键shape：cubes[B,9,8,72], tok[B,9,8,D], logits_k[B,9,8,Ks], logits_cls[B,num_classes], nll_map[B,9,8], anomaly_map_spatial[B,3,3]。
+
+实现要求：
+- 严禁joint_id；必须factorized(k,m)预测与NLL相加。
+- reshape/permute处写清楚并assert。
+- 代码必须自包含可运行（随机数据也行）。
+
+现在开始生成代码。

@@ -1,0 +1,36 @@
+# configs/hybridcnn.yaml
+data:
+  patch_size: 9       # patch 大小 (H=W=9)
+  cube_size: 3        # non-overlap cube 大小 (s=3)
+  pca_group: 8        # GWPCA 分组数
+  pca_nc_per_group: 8 # 每组 PCA 维度
+  pca_max_samples: 50000 # PCA 拟合采样上限（None 表示全量）
+  use_zscore: true    # 是否启用 z-score 归一化
+  zscore_max_samples: 50000 # z-score 统计采样上限（None 表示全量）
+  C_in: 64            # PCA 输出通道数 (T*L)
+  T: 8                # 光谱分组数
+  L: 8                # 每组波段数
+  num_classes: 9      # 分类类别数
+  dataset_name: WHU_Hi_LongKou # 数据集名称
+  data_path: WHU_Hi_LongKou.mat # 光谱数据路径
+  gt_path: WHU_Hi_LongKou_gt.mat # 标签路径
+  data_key: WHU_Hi_LongKou # 数据矩阵 key（可选）
+  gt_key: WHU_Hi_LongKou_gt # 标签矩阵 key（可选）
+  train_patches: 20  # 训练集 patch 数（每类）
+  val_patches: 20    # 验证集 patch 数（每类）
+  split_seed: 42     # 数据划分随机种子
+
+model:
+  fc_dim: 256        # 全连接隐藏维度
+  dropout: 0.4       # dropout
+
+train:
+  batch_size: 8  # batch 大小
+  epochs: 50    # 训练轮数
+  lr: 0.001      # 学习率
+  wd: 0.0        # 权重衰减
+  seed: 42       # 随机种子
+  num_workers: 4 # DataLoader 进程数
+  pin_memory: true # 是否锁页内存
+  persistent_workers: true # 是否保持 worker 常驻
+  prefetch_factor: 2 # 每个 worker 预取 batch 数
